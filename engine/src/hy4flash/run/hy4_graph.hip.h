@@ -2273,12 +2273,22 @@ public:
         const int cal_bkt = (T == 1) ? 0 : 1;
         const double base_share = !pf_bounce ? dec_pcie_auto_pinned[tc] : dec_pcie_auto_bounce[tc];
         double share_frac = 0.0;
+        // (#6848) the measured split for this bucket, else the other bucket's: T == 1 rarely gets a CPU sample because the
+        // nc <= 8 shortcut below takes those steps, so it borrows the T >= 2 measurement.  A share < 0.5 means GPU+PCIe computes
+        // fewer experts per ms than the CPU pool (bounce mode on an 8 GB laptop: 1.0 vs 7.4 exp/ms), where sending all is a loss.
+        const double cal_share = dec_cal[cal_bkt].share >= 0.0 ? dec_cal[cal_bkt].share : dec_cal[1 - cal_bkt].share;
+        const bool cpu_measured_faster = cal_share >= 0.0 && cal_share < 0.5;
+        const bool cal_done = dec_cal[cal_bkt].calibrated || dec_cal[1 - cal_bkt].calibrated;
         if (dec_pcie_share >= 0.0) {
             share_frac = dec_pcie_share;
-        } else if (nc <= 8 && !has_cold_miss && pcie_ok) {
+        } else if (pf_bounce && pcie_ok && !cal_done) {
+            share_frac = 0.01;  // (#6848) bounce mode (unpinned arena) before the split is measured: one miss per layer, enough to calibrate
+        } else if (pf_bounce && cpu_measured_faster) {
+            share_frac = 0.0;   // (#6848) bounce mode where the CPU pool measured faster per miss: keep every miss on the CPU (the 0.1.64 path)
+        } else if (nc <= 8 && !has_cold_miss && pcie_ok && !cpu_measured_faster) {
             share_frac = 1.0;  // tiny partial spill (<= 8 misses): stream all over async PCIe DMA (< 0.15 ms) -> zero TPS cliff!
         } else {
-            share_frac = (dec_cal[cal_bkt].share >= 0.0) ? dec_cal[cal_bkt].share : base_share;
+            share_frac = (cal_share >= 0.0) ? cal_share : base_share;  // (#6848) borrows the other bucket's measurement, as above
         }
         int gpu_e[128];
         int n_gpu_e = 0;
